@@ -5,12 +5,15 @@ from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, Sen
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.const import UnitOfEnergy
+from homeassistant.util import dt as dt_util
 from datetime import datetime
 
 from .const import (
     DOMAIN, MANUFACTURER, CONF_VEHICLE_TYPE, CONF_CURRENCY, 
     CONF_VEHICLE_ID, VEHICLE_TYPE_COMBUSTION, VEHICLE_TYPE_ELECTRIC, VEHICLE_TYPE_PHEV
 )
+from .fueling import fueling_reset
+from .history import CALCULATED_PREFIXES
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -127,10 +130,10 @@ def calculate_full_battery_range(data):
     consumption_per_100km = float(data['vehicle'].get('consumption', 0))
     if capacity <= 0 or consumption_per_100km <= 0: return None
     return round((capacity * 100) / consumption_per_100km)
-def calculate_monthly_energy_charged(charges):
+def calculate_monthly_energy_charged(charges, reference_date=None):
     """Calculates total kWh charged in the current month."""
     if not charges: return None
-    current_month_year = datetime.now().strftime('%m.%Y')
+    current_month_year = (reference_date or dt_util.now()).strftime('%m.%Y')
     total_kwh_this_month = 0.0
     for charge in charges:
         try:
@@ -173,7 +176,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         SpritmonitorSensor(coordinator, "last_refuel_date", lambda d: d.get('last_refueling', {}).get('date')),
         SpritmonitorSensor(coordinator, "last_refuel_odometer", lambda d: float(d.get('last_refueling', {}).get('odometer', 0)), device_class=SensorDeviceClass.DISTANCE, state_class=SensorStateClass.TOTAL),
         SpritmonitorSensor(coordinator, "last_refuel_trip", lambda d: float(d.get('last_refueling', {}).get('trip', 0)), device_class=SensorDeviceClass.DISTANCE, state_class=SensorStateClass.MEASUREMENT),
-        SpritmonitorSensor(coordinator, "last_refuel_cost", lambda d: format_cost(d.get('last_refueling', {}).get('cost', 0)), device_class=SensorDeviceClass.MONETARY, state_class=None),
+        SpritmonitorSensor(coordinator, "last_refuel_cost", lambda d: format_cost(d.get('last_refueling', {}).get('cost', 0)), device_class=SensorDeviceClass.MONETARY, state_class=SensorStateClass.TOTAL),
         SpritmonitorSensor(coordinator, "last_refuel_type", lambda d: d.get('last_refueling', {}).get('type')),
         SpritmonitorSensor(coordinator, "last_refuel_location", lambda d: d.get('last_refueling', {}).get('location')),
         SpritmonitorSensor(coordinator, "last_refuel_country", lambda d: d.get('last_refueling', {}).get('country')),
@@ -193,7 +196,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     if is_combustion:
         combustion_sensors = [
             SpritmonitorSensor(coordinator, "fuel_capacity", lambda d: float(d['vehicle'].get('capacity', 0)), device_class=SensorDeviceClass.VOLUME),
-            SpritmonitorSensor(coordinator, "total_fuel", lambda d: float(d['vehicle'].get('quantitysum', 0)), device_class=SensorDeviceClass.VOLUME, state_class=SensorStateClass.TOTAL_INCREASING),
+            SpritmonitorSensor(coordinator, "total_fuel", lambda d: float(d['tank_totals'][1]['quantity'] if 'tank_totals' in d and vehicle_type == VEHICLE_TYPE_PHEV else d['vehicle'].get('quantitysum', 0)), device_class=SensorDeviceClass.VOLUME, state_class=SensorStateClass.TOTAL_INCREASING),
             SpritmonitorSensor(coordinator, "avg_consumption", lambda d: float(d['vehicle'].get('consumption', 0)), state_class=SensorStateClass.MEASUREMENT),
             SpritmonitorSensor(coordinator, "last_refuel_quantity", lambda d: float(d.get('last_gas_refueling', {}).get('quantity', 0)), state_class=SensorStateClass.MEASUREMENT),
             SpritmonitorSensor(coordinator, "last_refuel_price_per_liter", lambda d: calculate_price_per_unit(d.get('last_gas_refueling', {}).get('cost'), d.get('last_gas_refueling', {}).get('quantity')), state_class=SensorStateClass.MEASUREMENT),
@@ -206,13 +209,13 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     if is_electric:
         electric_sensors = [
             SpritmonitorSensor(coordinator, "battery_capacity", lambda d: float(d['vehicle'].get('capacity', 0)), device_class=SensorDeviceClass.ENERGY, state_class=None),
-            SpritmonitorSensor(coordinator, "total_energy_charged", lambda d: float(d['vehicle'].get('quantitysum', 0)), device_class=SensorDeviceClass.ENERGY, state_class=SensorStateClass.TOTAL_INCREASING),
-            SpritmonitorSensor(coordinator, "avg_energy_consumption", lambda d: float(d['vehicle'].get('consumption', 0)), state_class=SensorStateClass.MEASUREMENT),
-            SpritmonitorSensor(coordinator, "last_charge_energy", lambda d: float(d.get('last_electric_charge', {}).get('quantity', 0)), device_class=SensorDeviceClass.ENERGY, state_class=None),
+            SpritmonitorSensor(coordinator, "total_energy_charged", lambda d: float(d['tank_totals'][2]['quantity'] if 'tank_totals' in d and vehicle_type == VEHICLE_TYPE_PHEV else d['vehicle'].get('quantitysum', 0)), device_class=SensorDeviceClass.ENERGY, state_class=SensorStateClass.TOTAL_INCREASING),
+            SpritmonitorSensor(coordinator, "avg_energy_consumption", lambda d: float(d['tank_totals'][2]['consumption'] if 'tank_totals' in d and vehicle_type == VEHICLE_TYPE_PHEV else d['vehicle'].get('consumption', 0)), state_class=SensorStateClass.MEASUREMENT),
+            SpritmonitorSensor(coordinator, "last_charge_energy", lambda d: float(d.get('last_electric_charge', {}).get('quantity', 0)), device_class=SensorDeviceClass.ENERGY, state_class=SensorStateClass.MEASUREMENT),
             SpritmonitorSensor(coordinator, "last_charge_price_per_kwh", lambda d: calculate_price_per_unit(d.get('last_electric_charge', {}).get('cost'), d.get('last_electric_charge', {}).get('quantity')), state_class=SensorStateClass.MEASUREMENT),
             SpritmonitorSensor(coordinator, "last_charge_consumption", lambda d: float(d.get('last_electric_charge', {}).get('consumption', 0)), state_class=SensorStateClass.MEASUREMENT),
             SpritmonitorSensor(coordinator, "full_battery_range_estimate", lambda d: calculate_full_battery_range(d), device_class=SensorDeviceClass.DISTANCE, state_class=SensorStateClass.MEASUREMENT),
-            SpritmonitorSensor(coordinator, "monthly_energy_charged", lambda d: calculate_monthly_energy_charged(d.get('electric_charges', [])), device_class=SensorDeviceClass.ENERGY, state_class=SensorStateClass.TOTAL),
+            SpritmonitorSensor(coordinator, "monthly_energy_charged", lambda d: calculate_monthly_energy_charged(d.get('electric_charges', []), d.get('reference_date')), device_class=SensorDeviceClass.ENERGY, state_class=SensorStateClass.TOTAL),
             # Efficiency expressed as distance-per-kWh (e.g. mi/kWh or km/kWh),
             # calculated as the inverse of avg_energy_consumption (kWh/100distance).
             # Equivalent to the 'consumption' field on the Spritmonitor /tanks.json endpoint.
@@ -251,6 +254,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         all_sensors.extend(calculated_sensors)
     
     async_add_entities(all_sensors)
+    coordinator.fueling_history.sensors = {sensor.sensor_id: sensor for sensor in all_sensors}
 
 class SpritmonitorSensor(CoordinatorEntity, SensorEntity):
     _attr_has_entity_name = True
@@ -262,6 +266,8 @@ class SpritmonitorSensor(CoordinatorEntity, SensorEntity):
         self._vehicle_id = self.coordinator.config_entry.data.get(CONF_VEHICLE_ID)
         self._attr_device_class = kwargs.get("device_class")
         self._attr_state_class = kwargs.get("state_class")
+        if self.sensor_id.startswith(CALCULATED_PREFIXES):
+            self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_unique_id = f"spritmonitor_{self._vehicle_id}_{self.sensor_id}"
         self._attr_translation_key = self.sensor_id
         if self.sensor_id == "brand_model":
@@ -338,6 +344,16 @@ class SpritmonitorSensor(CoordinatorEntity, SensorEntity):
             return None
         except (KeyError, TypeError, AttributeError, ValueError, IndexError):
             return None
+
+    @property
+    def last_reset(self):
+        """Let Recorder continue cumulative costs and monthly energy after import."""
+        if self.sensor_id == "last_refuel_cost":
+            record = (self.coordinator.data or {}).get("last_refueling")
+            return fueling_reset(record, dt_util.DEFAULT_TIME_ZONE) if record else None
+        if self.sensor_id == "monthly_energy_charged":
+            return dt_util.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return None
 
     @property
     def available(self) -> bool:

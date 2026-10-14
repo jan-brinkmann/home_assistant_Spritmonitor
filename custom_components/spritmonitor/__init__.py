@@ -26,6 +26,8 @@ from .const import (
 )
 
 from .services import async_setup_services
+from .fueling import data_with_fuelings
+from .history import FuelingHistory, tank_totals
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,6 +53,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     }
 
     session = async_get_clientsession(hass)
+    history = FuelingHistory(hass, entry)
+    await history.async_load()
 
     async def async_update_data():
         """Fetch and process data from the API endpoint."""
@@ -77,28 +81,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 response.raise_for_status()
                 all_fuelings = await response.json()
 
-            # --- LÓGICA DE SEPARACIÓN MEJORADA ---
-            gas_refuelings = []
-            electric_charges = []
-
-            if vehicle_type == VEHICLE_TYPE_ELECTRIC:
-                # Si es un EV puro, todos los registros son eléctricos.
-                electric_charges = sorted(all_fuelings, key=lambda x: datetime.strptime(x['date'], '%d.%m.%Y'), reverse=True)
-            else:
-                # Para Combustión y PHEV, filtramos por tankid.
-                gas_refuelings = sorted([f for f in all_fuelings if f.get('tankid') == 1], key=lambda x: datetime.strptime(x['date'], '%d.%m.%Y'), reverse=True)
-                electric_charges = sorted([f for f in all_fuelings if f.get('tankid') == 2], key=lambda x: datetime.strptime(x['date'], '%d.%m.%Y'), reverse=True)
-            # --- FIN DE LA LÓGICA ---
-
-            last_gas_refueling = gas_refuelings[0] if gas_refuelings else None
-            last_electric_charge = electric_charges[0] if electric_charges else None
-            
-            # Para compatibilidad, 'refuelings' es la lista principal del vehículo
-            if vehicle_type == VEHICLE_TYPE_ELECTRIC:
-                refuelings = electric_charges
-            else:
-                refuelings = gas_refuelings
-            last_refueling = refuelings[0] if refuelings else None
+            all_fuelings = await history.async_merge_api(all_fuelings)
 
             reminders = None
             try:
@@ -109,12 +92,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except Exception as e:
                 _LOGGER.debug("Could not fetch reminders: %s", e)
 
-            return {
-                "vehicle": vehicle_info, "units": units, "last_refueling": last_refueling,
-                "refuelings": refuelings, "gas_refuelings": gas_refuelings,
-                "last_gas_refueling": last_gas_refueling, "electric_charges": electric_charges,
-                "last_electric_charge": last_electric_charge, "reminders": reminders,
-            }
+            data = data_with_fuelings(
+                {"vehicle": vehicle_info, "units": units, "reminders": reminders},
+                all_fuelings,
+                vehicle_type,
+            )
+            if history.imported:
+                data["tank_totals"] = tank_totals(all_fuelings)
+            return data
         except aiohttp.ClientError as e:
             raise UpdateFailed(f"Connection error with Spritmonitor: {e}")
         except Exception as e:
@@ -125,7 +110,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, _LOGGER, name=f"spritmonitor_{vehicle_id}",
         update_method=async_update_data,
         update_interval=timedelta(hours=update_interval_hours),
+        config_entry=entry,
     )
+    coordinator.fueling_history = history
 
     await coordinator.async_config_entry_first_refresh()
     hass.data[DOMAIN][entry.entry_id] = coordinator

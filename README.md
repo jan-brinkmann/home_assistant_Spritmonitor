@@ -205,6 +205,23 @@ mode: single
 
 ```
 
+## Import past refuelings from CSV
+
+After updating the integration and restarting Home Assistant:
+
+1. Export **all refuelings for the configured vehicle** as a CSV from Spritmonitor.
+2. Open **Settings → Devices & services → Spritmonitor → Configure** for that vehicle.
+3. Select the CSV file on your computer and submit it. Home Assistant reports the number of new and merged records when the import finishes.
+4. View the existing sensors' **long-term statistics**, for example with a Statistics Graph card. Historic data is stored under their existing entity IDs, including renamed entities.
+
+The importer reads the German semicolon-separated export documented in `doku-csv.txt`, including decimal commas, UTF-8 and Windows-1252. It expects **km and liters** (or kWh for charging) and the currency already configured for the sensors (`EUR` or `€`, for example). Use the complete export so cumulative totals and historical averages can be reconstructed.
+
+Records already fetched from the API, repeated CSV uploads, and repeated rows are merged using date, tank, odometer and quantity. No refuelings are posted to Spritmonitor. The local vehicle ledger survives restarts and subsequent API polls.
+
+CSV dates have no time of day. Statistics use local midnight, converted to UTC. Multiple refuelings on one day remain separate records; their hourly measurement statistics include mean, minimum and maximum, and cumulative statistics use the final total. The first entry can therefore create statistics in 2016 even when Home Assistant was installed much later.
+
+Home Assistant long-term statistics store numeric data. Text fields such as notes and locations are retained in the local ledger; the import does not insert historical text states in Recorder's regular, automatically purged state history. Rankings, maintenance reminders and capacity estimates cannot be reconstructed from a fueling export. Existing numeric sensors receive the necessary statistic classes; no new sensors are created. See [CHANGELOG.md](CHANGELOG.md) for details.
+
 ## Troubleshooting
 
 -   **Integration not found:** After installation, make sure you have restarted Home Assistant.
