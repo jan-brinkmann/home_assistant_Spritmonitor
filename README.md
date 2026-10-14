@@ -220,7 +220,7 @@ Records already fetched from the API, repeated CSV uploads, and repeated rows ar
 
 CSV dates have no time of day. Statistics use local midnight, converted to UTC. Multiple refuelings on one day remain separate records; their hourly measurement statistics include mean, minimum and maximum, and cumulative statistics use the final total. The first entry can therefore create statistics in 2016 even when Home Assistant was installed much later.
 
-Home Assistant long-term statistics store numeric data. Text fields such as notes and locations are retained in the local ledger; the import does not insert historical text states in Recorder's regular, automatically purged state history. Rankings, maintenance reminders and capacity estimates cannot be reconstructed from a fueling export. Existing numeric sensors receive the necessary statistic classes; no new sensors are created. See [CHANGELOG.md](CHANGELOG.md) for details.
+Home Assistant long-term statistics store numeric data. Text fields such as notes and locations are retained in the local ledger; the import does not insert historical text states in Recorder's regular, automatically purged state history. Rankings, maintenance reminders and capacity estimates cannot be reconstructed from a fueling export. Live sensor values, units, statistic classes and reset behavior remain as on `main`, and continue to use the latest API response. Sensors without a statistic class receive historical measurements only; automatic statistics remain limited to the sensors that already support them. No new sensors are created. Recorder must be enabled for the import; live polling also works without Recorder. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ## Troubleshooting
 

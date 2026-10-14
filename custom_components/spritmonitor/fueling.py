@@ -3,7 +3,7 @@
 import csv
 import io
 import math
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 ELECTRIC_FUELS = {19, 24}
@@ -153,8 +153,10 @@ def normalize_fueling(record, vehicle_type):
     """Keep API IDs and extra fields while normalizing the shared identity fields."""
     result = dict(record)
     result["date"] = fueling_date(result["date"]).strftime("%d.%m.%Y")
-    result["tankid"] = int(
-        result.get("tankid") or (2 if vehicle_type == "electric" else 1)
+    # A pure EV's API tank ID need not be 2. Use one canonical electric tank
+    # inside the ledger so the same charge from the CSV can be reconciled.
+    result["tankid"] = (
+        2 if vehicle_type == "electric" else int(result.get("tankid") or 1)
     )
     for key in NUMERIC_COLUMNS.values():
         value = result.get(key)
@@ -213,25 +215,29 @@ def fueling_sort_key(record):
     )
 
 
-def fueling_reset(record, timezone):
-    """A stable reset token for each cost observation, also on the same day.
-
-    The microseconds distinguish odometers; they do not claim a refueling time.
-    """
-    date = fueling_date(record["date"]).replace(tzinfo=timezone)
-    identity = round(float(record.get("odometer") or 0) * 100)
-    return date + timedelta(microseconds=identity)
-
-
 def data_with_fuelings(data, records, vehicle_type):
-    """Use the same ordering and tank separation for live and historical sensors."""
-    ordered = sorted(records, key=fueling_sort_key, reverse=True)
-    gas = [record for record in ordered if record["tankid"] == 1]
-    electric = [record for record in ordered if record["tankid"] == 2]
+    """Preserve main's tank separation and stable, date-only API ordering."""
+    def date_key(record):
+        return datetime.strptime(record["date"], "%d.%m.%Y")
+
+    if vehicle_type == "electric":
+        gas = []
+        electric = sorted(records, key=date_key, reverse=True)
+    else:
+        gas = sorted(
+            [record for record in records if record.get("tankid") == 1],
+            key=date_key,
+            reverse=True,
+        )
+        electric = sorted(
+            [record for record in records if record.get("tankid") == 2],
+            key=date_key,
+            reverse=True,
+        )
     primary = electric if vehicle_type == "electric" else gas
     return {
         **data,
-        "all_fuelings": ordered,
+        "all_fuelings": list(records),
         "refuelings": primary,
         "last_refueling": primary[0] if primary else None,
         "gas_refuelings": gas,

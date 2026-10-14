@@ -31,7 +31,11 @@
       "invalid_csv": "CSV-Import fehlgeschlagen. Beachte die Hinweise oben und wähle die Datei erneut aus.",
       "import_failed": "Statistikimport fehlgeschlagen. Prüfe das Protokoll und importiere dieselbe CSV erneut."
     },
-    "abort": {"integration_not_loaded": "Lade die Integration, bevor du ihre Historie importierst."}
+    "abort": {
+      "integration_not_loaded": "Lade die Integration, bevor du ihre Historie importierst.",
+      "history_unavailable": "Die gespeicherte Tankhistorie konnte nicht geladen werden. Prüfe das Protokoll und lade die Integration vor dem Import neu.",
+      "recorder_not_loaded": "Aktiviere Recorder, bevor du historische Statistiken importierst."
+    }
   },
   "entity": {
     "sensor": {

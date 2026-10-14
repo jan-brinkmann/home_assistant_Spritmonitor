@@ -1,21 +1,12 @@
 """Persistent fueling ledger and backfill of the existing entities' statistics."""
 
 import asyncio
+import logging
 import math
 from bisect import bisect_right
 from datetime import timedelta
 from functools import partial
 
-from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.db_schema import StatisticsShortTerm
-from homeassistant.components.recorder.models import StatisticMeanType
-from homeassistant.components.recorder.statistics import (
-    STATISTIC_UNIT_TO_UNIT_CONVERTER,
-    async_import_statistics,
-    get_metadata,
-    get_start_time,
-    statistics_during_period,
-)
 from homeassistant.components.sensor import SensorStateClass
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
@@ -26,10 +17,11 @@ from .fueling import (
     CSVImportError,
     data_with_fuelings,
     fueling_date,
-    fueling_reset,
     fueling_sort_key,
     merge_fuelings,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 HISTORICAL_SENSORS = {
     "total_distance",
@@ -90,7 +82,9 @@ def historical_snapshots(data, records, vehicle_type, timezone):
         consumption = primary["consumption"]
         if data["units"].get("consumption") in {"km/L", "km/l"}:
             consumption = 100 / consumption if consumption else 0
-        snapshot = data_with_fuelings(data, prefix, vehicle_type)
+        # At a historical observation, the most recent same-day event comes
+        # first. Live API ordering remains entirely unchanged.
+        snapshot = data_with_fuelings(data, list(reversed(prefix)), vehicle_type)
         snapshot["vehicle"] = {
             **data["vehicle"],
             "tripsum": primary["trip"],
@@ -109,7 +103,25 @@ def historical_snapshots(data, records, vehicle_type, timezone):
 
 def _sensor_value(sensor, data):
     try:
-        value = sensor._value_fn(data)
+        if (
+            "reference_date" in data
+            and sensor.coordinator.config_entry.data.get(CONF_VEHICLE_TYPE) == "phev"
+            and sensor.sensor_id in {"total_fuel", "total_energy_charged", "avg_energy_consumption"}
+        ):
+            # CSV exports identify individual tanks. Keep their historical
+            # aggregates separate without replacing today's API aggregates.
+            tank = 1 if sensor.sensor_id == "total_fuel" else 2
+            field = "consumption" if sensor.sensor_id == "avg_energy_consumption" else "quantity"
+            value = data["tank_totals"][tank][field]
+        elif sensor.sensor_id == "monthly_energy_charged" and "reference_date" in data:
+            month = data["reference_date"].strftime("%m.%Y")
+            value = round(sum(
+                float(record.get("quantity") or 0)
+                for record in data["electric_charges"]
+                if fueling_date(record["date"]).strftime("%m.%Y") == month
+            ), 2)
+        else:
+            value = sensor._value_fn(data)
         return (
             float(value) if value is not None and math.isfinite(float(value)) else None
         )
@@ -135,7 +147,7 @@ def build_statistics(sensor, snapshots, timezone, convert):
         } or key.endswith("_electric")
         primary_tank = (
             2
-            if sensor.coordinator.config_entry.data[CONF_VEHICLE_TYPE] == "electric"
+            if sensor.coordinator.config_entry.data.get(CONF_VEHICLE_TYPE) == "electric"
             else 1
         )
         if data["event_tank"] != (2 if electric else primary_tank):
@@ -145,7 +157,10 @@ def build_statistics(sensor, snapshots, timezone, convert):
             continue
         value = convert(value)
         row = {"start": start}
-        if sensor.state_class == SensorStateClass.MEASUREMENT:
+        # Sensors without a state class receive only the requested historical
+        # measurements. Their live state classes and Recorder behavior stay as
+        # on main; they do not acquire automatic statistics through this import.
+        if sensor.state_class in (None, SensorStateClass.MEASUREMENT):
             values = observations.setdefault(start, [])
             values.append(value)
             row.update(mean=sum(values) / len(values), min=min(values), max=max(values))
@@ -155,19 +170,9 @@ def build_statistics(sensor, snapshots, timezone, convert):
                 if first_odometer is None:
                     first_odometer = value
                 row["sum"] = value - first_odometer
-            elif key == "last_refuel_cost":
-                row["sum"] = convert(
-                    sum(float(r.get("cost") or 0) for r in data["refuelings"])
-                )
-                row["last_reset"] = dt_util.as_utc(
-                    fueling_reset(data["last_refueling"], timezone)
-                )
-            elif key == "monthly_energy_charged":
-                row["sum"] = convert(data["tank_totals"][2]["quantity"])
-                row["last_reset"] = dt_util.as_utc(
-                    data["reference_date"].replace(day=1, tzinfo=timezone)
-                )
             else:
+                # Preserve TOTAL's signed changes (including monthly drops),
+                # without adding new reset semantics to the live sensors.
                 row["sum"] = value
         rows[start] = row
     return [rows[start] for start in sorted(rows)]
@@ -216,17 +221,23 @@ class FuelingHistory:
     def __init__(self, hass, entry):
         self.hass = hass
         self.entry = entry
-        self.vehicle_type = entry.data[CONF_VEHICLE_TYPE]
+        self.vehicle_type = entry.data.get(CONF_VEHICLE_TYPE)
         self.store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.fuelings")
         self.records = []
         self.imported = False
+        self.load_error = None
         self.lock = asyncio.Lock()
         self.sensors = {}
 
     async def async_load(self):
-        if saved := await self.store.async_load():
-            self.records = saved.get("records", [])
-            self.imported = saved.get("imported", False)
+        """Load the import ledger without making live setup depend on storage."""
+        try:
+            if saved := await self.store.async_load():
+                self.records = saved.get("records", [])
+                self.imported = saved.get("imported", False)
+        except Exception as err:
+            self.load_error = err
+            _LOGGER.warning("Could not load CSV history: %s", err, exc_info=True)
 
     async def _async_save(self):
         await self.store.async_save(
@@ -234,12 +245,19 @@ class FuelingHistory:
         )
 
     async def async_merge_api(self, incoming):
-        async with self.lock:
-            merged, _, _ = merge_fuelings(self.records, incoming, self.vehicle_type)
-            if merged != self.records:
-                self.records = merged
-                await self._async_save()
-            return list(self.records)
+        """Cache API records for imports without affecting the live response."""
+        if self.load_error is None:
+            try:
+                async with self.lock:
+                    merged, _, _ = merge_fuelings(self.records, incoming, self.vehicle_type)
+                    if merged != self.records:
+                        await self.store.async_save(
+                            {"records": merged, "imported": self.imported}
+                        )
+                        self.records = merged
+            except Exception as err:
+                _LOGGER.warning("Could not cache API fuelings for CSV import: %s", err, exc_info=True)
+        return list(self.records)
 
     def validate_units(self, coordinator, records):
         units = coordinator.data["units"]
@@ -265,13 +283,18 @@ class FuelingHistory:
             )
 
     async def async_import(self, coordinator, records):
+        from homeassistant.components.recorder import get_instance
+        from homeassistant.components.recorder.db_schema import StatisticsShortTerm
+        from homeassistant.components.recorder.statistics import async_import_statistics
+
+        if self.load_error is not None:
+            raise HomeAssistantError("CSV history storage is unavailable")
         self.validate_units(coordinator, records)
         async with self.lock:
             merged, added, duplicates = merge_fuelings(
                 self.records, records, self.vehicle_type
             )
-            data = data_with_fuelings(coordinator.data, merged, self.vehicle_type)
-            data["tank_totals"] = tank_totals(merged)
+            data = coordinator.data
             series = await self._async_prepare_statistics(data, merged)
             if not series:
                 raise CSVImportError(
@@ -281,7 +304,6 @@ class FuelingHistory:
             self.imported = True
             # Persist the source first, so an interrupted import can be retried.
             await self._async_save()
-            coordinator.async_set_updated_data(data)
             recorder = get_instance(self.hass)
             for metadata, hourly, short in series:
                 async_import_statistics(self.hass, metadata, hourly)
@@ -300,6 +322,10 @@ class FuelingHistory:
 
     def _verify_statistics(self, series):
         """Don't report success if Recorder failed or deferred a database write."""
+        from homeassistant.components.recorder.statistics import (
+            statistics_during_period,
+        )
+
         for metadata, hourly, short in series:
             statistic_id = metadata["statistic_id"]
             units = {metadata["unit_class"]: metadata["unit_of_measurement"]}
@@ -329,6 +355,15 @@ class FuelingHistory:
                     )
 
     async def _async_prepare_statistics(self, data, records):
+        from homeassistant.components.recorder import get_instance
+        from homeassistant.components.recorder.models import StatisticMeanType
+        from homeassistant.components.recorder.statistics import (
+            STATISTIC_UNIT_TO_UNIT_CONVERTER,
+            get_metadata,
+            get_start_time,
+            statistics_during_period,
+        )
+
         recorder = get_instance(self.hass)
         if not await recorder.async_db_ready:
             raise HomeAssistantError("Recorder database is unavailable")
@@ -406,7 +441,7 @@ class FuelingHistory:
                     "unit_of_measurement": target_unit,
                 }
             )
-            measurement = sensor.state_class == SensorStateClass.MEASUREMENT
+            measurement = sensor.state_class in (None, SensorStateClass.MEASUREMENT)
             meta["mean_type"] = (
                 StatisticMeanType.ARITHMETIC if measurement else StatisticMeanType.NONE
             )
@@ -464,12 +499,6 @@ class FuelingHistory:
                     if "last_reset" not in bridge:
                         bridge["sum"] += current - bridge["state"]
                     bridge["state"] = current
-                if sensor.sensor_id == "monthly_energy_charged":
-                    bridge["last_reset"] = dt_util.as_utc(
-                        dt_util.now().replace(
-                            day=1, hour=0, minute=0, second=0, microsecond=0
-                        )
-                    )
                 short_rows = [
                     row for row in short_rows if row["start"] != bridge["start"]
                 ]
