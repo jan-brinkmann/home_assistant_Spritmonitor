@@ -16,6 +16,25 @@
       }
     }
   },
+  "options": {
+    "progress": {"import": "Importing fueling history and writing statistics…"},
+    "step": {
+      "init": {
+        "title": "Import fueling history from CSV",
+        "description": "Upload this vehicle's complete Spritmonitor export (semicolon-separated, km and liters or kWh). Historical statistics of the existing sensors are rewritten; known API/CSV records are merged. CSV dates use midnight in your Home Assistant time zone. {error}",
+        "data": {"csv_file": "Spritmonitor CSV export"}
+      }
+    },
+    "error": {
+      "invalid_csv": "The CSV could not be imported. Check the details above and select the file again.",
+      "import_failed": "The statistics import failed. Check the logs and retry the same CSV."
+    },
+    "abort": {
+      "integration_not_loaded": "Load the integration before importing its history.",
+      "history_unavailable": "The saved fueling history could not be loaded. Check the logs and reload the integration before importing.",
+      "recorder_not_loaded": "Enable Recorder before importing historical statistics."
+    }
+  },
   "entity": {
     "sensor": {
       "brand_model": { "name": "Brand and Model" },

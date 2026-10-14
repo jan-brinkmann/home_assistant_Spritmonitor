@@ -5,6 +5,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import voluptuous as vol
 import aiohttp
 import logging
+from homeassistant.core import callback
 
 from .const import (
     DOMAIN,
@@ -27,6 +28,13 @@ _LOGGER = logging.getLogger(__name__)
 class SpritmonitorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
     _attr_translation_domain = DOMAIN
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        from .options_flow import SpritmonitorOptionsFlow
+
+        return SpritmonitorOptionsFlow()
 
     async def async_step_user(self, user_input=None):
         errors = {}

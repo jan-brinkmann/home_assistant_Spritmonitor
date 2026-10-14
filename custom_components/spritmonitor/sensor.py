@@ -1,6 +1,7 @@
 # Contenido para: sensor.py
 
 import logging
+import math
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, SensorStateClass
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import DeviceInfo
@@ -11,11 +12,13 @@ from .const import (
     DOMAIN, MANUFACTURER, CONF_VEHICLE_TYPE, CONF_CURRENCY, 
     CONF_VEHICLE_ID, VEHICLE_TYPE_COMBUSTION, VEHICLE_TYPE_ELECTRIC, VEHICLE_TYPE_PHEV
 )
+from .fueling import display_consumption, is_inverse_consumption, valid_fuelings
+from .history import is_aggregate_sensor
 
 _LOGGER = logging.getLogger(__name__)
 
 def calculate_price_per_unit(cost, quantity):
-    if not cost or not quantity or float(quantity) == 0: return None
+    if cost is None or quantity is None or float(quantity) == 0: return None
     return round(float(cost) / float(quantity), 3)
 def format_cost(cost):
     if cost is None: return None
@@ -60,63 +63,88 @@ def calculate_range_estimate(data):
     if '100' in consumption_unit:
         return round((fuel_level / consumption_val) * 100)
     return round(fuel_level * consumption_val)
-def calculate_consumption_trend(refuelings):
-    if not refuelings or len(refuelings) < 3: return None
-    consumptions = [float(r['consumption']) for r in refuelings[:5] if r.get('consumption') and float(r.get('consumption')) > 0]
+def _measurements(refuelings, key):
+    """Missing values are unknown; finite zeroes are real observations."""
+    values = []
+    for record in valid_fuelings(refuelings or []):
+        value = record.get(key)
+        if value not in (None, ""):
+            value = float(value)
+            if math.isfinite(value):
+                values.append(value)
+    return values
+
+
+def calculate_average_consumption(data, electric=False):
+    if "tank_totals" in data:
+        value = data["tank_totals"][2 if electric else 1]["consumption"]
+        return value if electric else display_consumption(value, data["units"].get("consumption"))
+    value = data.get("vehicle", {}).get("consumption")
+    return float(value) if value is not None else None
+
+
+def calculate_consumption_trend(refuelings, inverse=False):
+    """Compare the newer and older halves of the entire observed history."""
+    consumptions = _measurements(refuelings, "consumption")
     if len(consumptions) < 3: return None
-    recent_avg = sum(consumptions[:2]) / 2
-    older_avg = sum(consumptions[2:4]) / 2 if len(consumptions) >= 4 else consumptions[2]
-    if older_avg == 0: return "stable"
-    trend_ratio = recent_avg / older_avg
+    middle = len(consumptions) // 2
+    recent_avg = sum(consumptions[:middle]) / middle
+    older_avg = sum(consumptions[middle:]) / (len(consumptions) - middle)
+    if older_avg == 0:
+        trend_ratio = 1 if recent_avg == 0 else math.inf
+    else:
+        trend_ratio = recent_avg / older_avg
+    if inverse:
+        trend_ratio = 1 / trend_ratio if trend_ratio > 0 else math.inf
     if trend_ratio < 0.95: return "improving"
     elif trend_ratio > 1.05: return "worsening"
     else: return "stable"
 def calculate_consumption_consistency(refuelings):
-    if not refuelings or len(refuelings) < 3: return None
-    consumptions = [float(r['consumption']) for r in refuelings[:5] if r.get('consumption') and float(r.get('consumption')) > 0]
+    consumptions = _measurements(refuelings, "consumption")
     if len(consumptions) < 3: return None
     mean = sum(consumptions) / len(consumptions)
     variance = sum((x - mean) ** 2 for x in consumptions) / len(consumptions)
     return round(variance ** 0.5, 2)
 def calculate_avg_refuel_quantity(refuelings):
-    if not refuelings: return None
-    quantities = [float(r['quantity']) for r in refuelings[:5] if r.get('quantity') and float(r.get('quantity')) > 0]
+    quantities = _measurements(refuelings, "quantity")
     if not quantities: return None
     return round(sum(quantities) / len(quantities), 1)
 def calculate_avg_days_between_refuels(refuelings):
-    if not refuelings or len(refuelings) < 2: return None
-    dates = [datetime.strptime(r['date'], '%d.%m.%Y') for r in refuelings[:5] if r.get('date')]
+    dates = sorted(datetime.strptime(r['date'], '%d.%m.%Y') for r in valid_fuelings(refuelings or []) if r.get('date'))
     if len(dates) < 2: return None
-    days_diffs = [(dates[i] - dates[i + 1]).days for i in range(len(dates) - 1) if (dates[i] - dates[i + 1]).days > 0]
-    if not days_diffs: return None
-    return round(sum(days_diffs) / len(days_diffs), 1)
+    return round((dates[-1] - dates[0]).days / (len(dates) - 1), 1)
 def calculate_price_variability(refuelings):
-    if not refuelings: return None
-    prices_per_unit = [float(r['cost']) / float(r['quantity']) for r in refuelings[:5] if r.get('cost') and r.get('quantity') and float(r.get('quantity')) > 0]
+    prices_per_unit = [float(r['cost']) / float(r['quantity']) for r in valid_fuelings(refuelings or []) if r.get('cost') is not None and r.get('quantity') is not None and float(r['quantity']) > 0]
     if len(prices_per_unit) < 2: return None
     return round(max(prices_per_unit) - min(prices_per_unit), 2)
-def calculate_eco_driving_index(refuelings, vehicle_avg_consumption):
-    if not refuelings or not vehicle_avg_consumption or float(vehicle_avg_consumption) == 0: return None
-    recent_consumptions = [float(r['consumption']) for r in refuelings[:3] if r.get('consumption') and float(r.get('consumption')) > 0]
-    if not recent_consumptions: return None
-    recent_avg = sum(recent_consumptions) / len(recent_consumptions)
+def calculate_eco_driving_index(refuelings, vehicle_avg_consumption, inverse=False):
+    if vehicle_avg_consumption is None: return None
+    consumptions = _measurements(refuelings, "consumption")
+    if not consumptions: return None
+    overall_avg = sum(consumptions) / len(consumptions)
     vehicle_avg = float(vehicle_avg_consumption)
-    performance_ratio = recent_avg / vehicle_avg
+    if vehicle_avg == 0:
+        performance_ratio = 1 if overall_avg == 0 else math.inf
+    else:
+        performance_ratio = overall_avg / vehicle_avg
+    if inverse:
+        performance_ratio = 1 / performance_ratio if performance_ratio > 0 else math.inf
     if performance_ratio < 0.9: performance_score = 10
     elif performance_ratio < 1.0: performance_score = 8
     elif performance_ratio < 1.1: performance_score = 6
     else: performance_score = 4
-    consistency = calculate_consumption_consistency(refuelings) or 5
+    consistency = calculate_consumption_consistency(refuelings)
+    if consistency is None:
+        consistency = 5
     consistency_score = max(0, 10 - consistency * 5)
     eco_index = (performance_score * 0.7 + consistency_score * 0.3)
     return round(eco_index, 1)
 def calculate_cost_per_distance(refuelings):
-    if not refuelings or len(refuelings) < 2: return None
     total_cost, total_trip = 0.0, 0.0
-    for r in refuelings[:10]:
+    for r in valid_fuelings(refuelings or []):
         cost = r.get('cost')
         trip = r.get('trip')
-        if cost and trip and float(trip) > 0:
+        if cost is not None and trip is not None and float(trip) >= 0:
             total_cost += float(cost)
             total_trip += float(trip)
     if total_trip == 0: return None
@@ -124,8 +152,8 @@ def calculate_cost_per_distance(refuelings):
 def calculate_full_battery_range(data):
     if not data.get('vehicle'): return None
     capacity = float(data['vehicle'].get('capacity', 0))
-    consumption_per_100km = float(data['vehicle'].get('consumption', 0))
-    if capacity <= 0 or consumption_per_100km <= 0: return None
+    consumption_per_100km = calculate_average_consumption(data, electric=True)
+    if capacity <= 0 or consumption_per_100km is None or consumption_per_100km <= 0: return None
     return round((capacity * 100) / consumption_per_100km)
 def calculate_monthly_energy_charged(charges):
     """Calculates total kWh charged in the current month."""
@@ -154,8 +182,8 @@ def calculate_efficiency_per_distance(data):
     more intuitive for EV drivers familiar with MPGe-style figures.
     """
     if not data.get('vehicle'): return None
-    consumption = float(data['vehicle'].get('consumption', 0))
-    if consumption <= 0: return None
+    consumption = calculate_average_consumption(data, electric=True)
+    if consumption is None or consumption <= 0: return None
     return round(100 / consumption, 2)
 
 
@@ -207,7 +235,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         electric_sensors = [
             SpritmonitorSensor(coordinator, "battery_capacity", lambda d: float(d['vehicle'].get('capacity', 0)), device_class=SensorDeviceClass.ENERGY, state_class=None),
             SpritmonitorSensor(coordinator, "total_energy_charged", lambda d: float(d['vehicle'].get('quantitysum', 0)), device_class=SensorDeviceClass.ENERGY, state_class=SensorStateClass.TOTAL_INCREASING),
-            SpritmonitorSensor(coordinator, "avg_energy_consumption", lambda d: float(d['vehicle'].get('consumption', 0)), state_class=SensorStateClass.MEASUREMENT),
+            SpritmonitorSensor(coordinator, "avg_energy_consumption", lambda d: calculate_average_consumption(d, electric=True), state_class=SensorStateClass.MEASUREMENT),
             SpritmonitorSensor(coordinator, "last_charge_energy", lambda d: float(d.get('last_electric_charge', {}).get('quantity', 0)), device_class=SensorDeviceClass.ENERGY, state_class=None),
             SpritmonitorSensor(coordinator, "last_charge_price_per_kwh", lambda d: calculate_price_per_unit(d.get('last_electric_charge', {}).get('cost'), d.get('last_electric_charge', {}).get('quantity')), state_class=SensorStateClass.MEASUREMENT),
             SpritmonitorSensor(coordinator, "last_charge_consumption", lambda d: float(d.get('last_electric_charge', {}).get('consumption', 0)), state_class=SensorStateClass.MEASUREMENT),
@@ -222,35 +250,36 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     
     if vehicle_type == VEHICLE_TYPE_PHEV:
         phev_calculated_sensors = [
-            SpritmonitorSensor(coordinator, "consumption_trend_fuel", lambda d: calculate_consumption_trend(d.get('gas_refuelings', []))),
+            SpritmonitorSensor(coordinator, "consumption_trend_fuel", lambda d: calculate_consumption_trend(d.get('gas_refuelings', []), is_inverse_consumption(d.get('units', {}).get('consumption')))),
             SpritmonitorSensor(coordinator, "consumption_consistency_fuel", lambda d: calculate_consumption_consistency(d.get('gas_refuelings', []))),
             SpritmonitorSensor(coordinator, "avg_refuel_quantity_fuel", lambda d: calculate_avg_refuel_quantity(d.get('gas_refuelings', []))),
             SpritmonitorSensor(coordinator, "avg_days_between_refuels_fuel", lambda d: calculate_avg_days_between_refuels(d.get('gas_refuelings', []))),
             SpritmonitorSensor(coordinator, "price_variability_fuel", lambda d: calculate_price_variability(d.get('gas_refuelings', []))),
-            SpritmonitorSensor(coordinator, "eco_driving_index_fuel", lambda d: calculate_eco_driving_index(d.get('gas_refuelings', []), d.get('vehicle', {}).get('consumption'))),
+            SpritmonitorSensor(coordinator, "eco_driving_index_fuel", lambda d: calculate_eco_driving_index(d.get('gas_refuelings', []), calculate_average_consumption(d), is_inverse_consumption(d.get('units', {}).get('consumption')))),
             SpritmonitorSensor(coordinator, "cost_per_distance_fuel", lambda d: calculate_cost_per_distance(d.get('gas_refuelings', []))),
             SpritmonitorSensor(coordinator, "consumption_trend_electric", lambda d: calculate_consumption_trend(d.get('electric_charges', []))),
             SpritmonitorSensor(coordinator, "consumption_consistency_electric", lambda d: calculate_consumption_consistency(d.get('electric_charges', []))),
             SpritmonitorSensor(coordinator, "avg_refuel_quantity_electric", lambda d: calculate_avg_refuel_quantity(d.get('electric_charges', []))),
             SpritmonitorSensor(coordinator, "avg_days_between_refuels_electric", lambda d: calculate_avg_days_between_refuels(d.get('electric_charges', []))),
             SpritmonitorSensor(coordinator, "price_variability_electric", lambda d: calculate_price_variability(d.get('electric_charges', []))),
-            SpritmonitorSensor(coordinator, "eco_driving_index_electric", lambda d: calculate_eco_driving_index(d.get('electric_charges', []), d.get('vehicle', {}).get('consumption'))),
+            SpritmonitorSensor(coordinator, "eco_driving_index_electric", lambda d: calculate_eco_driving_index(d.get('electric_charges', []), calculate_average_consumption(d, electric=True))),
             SpritmonitorSensor(coordinator, "cost_per_distance_electric", lambda d: calculate_cost_per_distance(d.get('electric_charges', []))),
         ]
         all_sensors.extend(phev_calculated_sensors)
     else:
         calculated_sensors = [
-            SpritmonitorSensor(coordinator, "consumption_trend", lambda d: calculate_consumption_trend(d.get('refuelings', []))),
+            SpritmonitorSensor(coordinator, "consumption_trend", lambda d: calculate_consumption_trend(d.get('refuelings', []), is_inverse_consumption(d.get('units', {}).get('consumption')))),
             SpritmonitorSensor(coordinator, "consumption_consistency", lambda d: calculate_consumption_consistency(d.get('refuelings', []))),
             SpritmonitorSensor(coordinator, "avg_refuel_quantity", lambda d: calculate_avg_refuel_quantity(d.get('refuelings', []))),
             SpritmonitorSensor(coordinator, "avg_days_between_refuels", lambda d: calculate_avg_days_between_refuels(d.get('refuelings', []))),
             SpritmonitorSensor(coordinator, "price_variability", lambda d: calculate_price_variability(d.get('refuelings', []))),
-            SpritmonitorSensor(coordinator, "eco_driving_index", lambda d: calculate_eco_driving_index(d.get('refuelings', []), d.get('vehicle', {}).get('consumption'))),
+            SpritmonitorSensor(coordinator, "eco_driving_index", lambda d: calculate_eco_driving_index(d.get('refuelings', []), d.get('vehicle', {}).get('consumption'), is_inverse_consumption(d.get('units', {}).get('consumption')))),
             SpritmonitorSensor(coordinator, "cost_per_distance", lambda d: calculate_cost_per_distance(d.get('refuelings', []))),
         ]
         all_sensors.extend(calculated_sensors)
     
     async_add_entities(all_sensors)
+    coordinator.fueling_history.sensors = {sensor.sensor_id: sensor for sensor in all_sensors}
 
 class SpritmonitorSensor(CoordinatorEntity, SensorEntity):
     _attr_has_entity_name = True
@@ -258,7 +287,10 @@ class SpritmonitorSensor(CoordinatorEntity, SensorEntity):
     def __init__(self, coordinator, sensor_id, value_fn, **kwargs):
         super().__init__(coordinator)
         self.sensor_id = sensor_id
-        self._value_fn = value_fn
+        self._value_fn = (
+            (lambda data: value_fn(data.get("fueling_statistics", data)))
+            if is_aggregate_sensor(sensor_id) else value_fn
+        )
         self._vehicle_id = self.coordinator.config_entry.data.get(CONF_VEHICLE_ID)
         self._attr_device_class = kwargs.get("device_class")
         self._attr_state_class = kwargs.get("state_class")

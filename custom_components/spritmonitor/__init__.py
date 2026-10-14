@@ -26,6 +26,7 @@ from .const import (
 )
 
 from .services import async_setup_services
+from .history import FuelingHistory
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,6 +52,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     }
 
     session = async_get_clientsession(hass)
+    history = FuelingHistory(hass, entry)
+    await history.async_load()
 
     async def async_update_data():
         """Fetch and process data from the API endpoint."""
@@ -76,6 +79,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             async with session.get(f"{fuelings_url}?limit=20", headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
                 response.raise_for_status()
                 all_fuelings = await response.json()
+
+            await history.async_merge_api(all_fuelings)
 
             # --- LÓGICA DE SEPARACIÓN MEJORADA ---
             gas_refuelings = []
@@ -109,12 +114,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except Exception as e:
                 _LOGGER.debug("Could not fetch reminders: %s", e)
 
-            return {
+            return history.with_statistics({
                 "vehicle": vehicle_info, "units": units, "last_refueling": last_refueling,
                 "refuelings": refuelings, "gas_refuelings": gas_refuelings,
                 "last_gas_refueling": last_gas_refueling, "electric_charges": electric_charges,
                 "last_electric_charge": last_electric_charge, "reminders": reminders,
-            }
+            })
         except aiohttp.ClientError as e:
             raise UpdateFailed(f"Connection error with Spritmonitor: {e}")
         except Exception as e:
@@ -126,6 +131,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         update_method=async_update_data,
         update_interval=timedelta(hours=update_interval_hours),
     )
+
+    coordinator.fueling_history = history
 
     await coordinator.async_config_entry_first_refresh()
     hass.data[DOMAIN][entry.entry_id] = coordinator

@@ -18,6 +18,25 @@
     "error": { "invalid_auth": "Authentifizierung fehlgeschlagen.", "cannot_connect": "Verbindung fehlgeschlagen." },
     "abort": { "already_configured": "Das Fahrzeug ist bereits konfiguriert." }
   },
+  "options": {
+    "progress": {"import": "Tankhistorie wird importiert und Statistik geschrieben…"},
+    "step": {
+      "init": {
+        "title": "Tankhistorie aus CSV importieren",
+        "description": "Lade den vollständigen Spritmonitor-Export dieses Fahrzeugs hoch (Semikolon, Kilometer und Liter bzw. kWh). Die Langzeitstatistik der vorhandenen Sensoren wird rückwirkend neu geschrieben; bekannte API-/CSV-Tankvorgänge werden zusammengeführt. CSV-Daten werden Mitternacht in der Home-Assistant-Zeitzone zugeordnet. {error}",
+        "data": {"csv_file": "Spritmonitor-CSV-Export"}
+      }
+    },
+    "error": {
+      "invalid_csv": "CSV-Import fehlgeschlagen. Beachte die Hinweise oben und wähle die Datei erneut aus.",
+      "import_failed": "Statistikimport fehlgeschlagen. Prüfe das Protokoll und importiere dieselbe CSV erneut."
+    },
+    "abort": {
+      "integration_not_loaded": "Lade die Integration, bevor du ihre Historie importierst.",
+      "history_unavailable": "Die gespeicherte Tankhistorie konnte nicht geladen werden. Prüfe das Protokoll und lade die Integration vor dem Import neu.",
+      "recorder_not_loaded": "Aktiviere Recorder, bevor du historische Statistiken importierst."
+    }
+  },
   "entity": {
     "sensor": {
       "brand_model": { "name": "Marke und Modell" },
