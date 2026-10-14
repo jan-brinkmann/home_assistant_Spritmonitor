@@ -16,9 +16,11 @@ from .const import CONF_CURRENCY, CONF_VEHICLE_TYPE, DOMAIN
 from .fueling import (
     CSVImportError,
     data_with_fuelings,
+    display_consumption,
     fueling_date,
     fueling_sort_key,
     merge_fuelings,
+    valid_fuelings,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,26 +51,90 @@ CALCULATED_PREFIXES = (
     "eco_driving_index",
     "cost_per_distance",
 )
+AGGREGATE_SENSORS = {
+    "avg_consumption", "avg_energy_consumption", "efficiency_per_distance",
+    "full_battery_range_estimate", "range_estimate",
+}
+
+
+def is_aggregate_sensor(key):
+    return key in AGGREGATE_SENSORS or key.startswith(
+        (*CALCULATED_PREFIXES, "consumption_trend")
+    )
 
 
 def tank_totals(records):
-    """Cumulative totals; first fills establish the average consumption baseline."""
+    """Totals and measured consumption between completed full-tank boundaries.
+
+    Partial fills count in quantity totals immediately. Their consumption becomes
+    known only when a full fill closes the interval, avoiding future CSV values.
+    """
     result = {}
     for tank in (1, 2):
-        valid = [
-            r for r in records if r["tankid"] == tank and r.get("type") != "invalid"
-        ]
+        ordered = sorted(
+            [r for r in records if r["tankid"] == tank], key=fueling_sort_key
+        )
+        valid = valid_fuelings(ordered)
         quantity = sum(float(r.get("quantity") or 0) for r in valid)
         trip = sum(float(r.get("trip") or 0) for r in valid)
-        consumed = sum(
-            float(r.get("quantity") or 0) for r in valid if r.get("type") != "first"
-        )
+        consumed = distance = pending_quantity = pending_trip = 0.0
+        complete = anchored = True
+        fuelings = []
+        for raw in ordered:
+            kind = raw.get("type", "full")
+            if kind in ("invalid", 0):
+                anchored = False
+                pending_quantity = pending_trip = 0.0
+                complete = True
+                continue
+            record = {**raw, "consumption": None}
+            fuelings.append(record)
+            if kind == "first":
+                pending_quantity = pending_trip = 0.0
+                complete = anchored = True
+                continue
+            if raw.get("quantity") is None or raw.get("trip") is None:
+                complete = False
+            else:
+                pending_quantity += float(raw["quantity"])
+                pending_trip += float(raw["trip"])
+            if kind == "full":
+                if anchored and complete and pending_trip > 0:
+                    consumed += pending_quantity
+                    distance += pending_trip
+                    record["consumption"] = pending_quantity * 100 / pending_trip
+                pending_quantity = pending_trip = 0.0
+                complete = anchored = True
         result[tank] = {
             "quantity": quantity,
             "trip": trip,
-            "consumption": consumed * 100 / trip if trip else 0,
+            "consumption": consumed * 100 / distance if distance > 0 else None,
+            "fuelings": fuelings,
         }
     return result
+
+
+def statistics_data(data, records, vehicle_type):
+    """One history and one unit convention for live and reconstructed averages."""
+    base = {key: value for key, value in data.items() if key != "fueling_statistics"}
+    totals = tank_totals(records)
+    unit = base["units"].get("consumption")
+    fuelings = []
+    for tank, total in totals.items():
+        for raw in total["fuelings"]:
+            record = dict(raw)
+            if tank == 1:
+                record["consumption"] = display_consumption(raw["consumption"], unit)
+            fuelings.append(record)
+    ordered = sorted(fuelings, key=fueling_sort_key, reverse=True)
+    snapshot = data_with_fuelings(base, ordered, vehicle_type)
+    primary = totals[2 if vehicle_type == "electric" else 1]
+    consumption = primary["consumption"]
+    if vehicle_type != "electric":
+        consumption = display_consumption(consumption, unit)
+    snapshot["vehicle"] = {**base["vehicle"], "consumption": consumption}
+    snapshot["tank_totals"] = totals
+    return snapshot
 
 
 def historical_snapshots(data, records, vehicle_type, timezone):
@@ -77,21 +143,14 @@ def historical_snapshots(data, records, vehicle_type, timezone):
     prefix = []
     for record in sorted(records, key=fueling_sort_key):
         prefix.append(record)
-        totals = tank_totals(prefix)
+        snapshot = statistics_data(data, prefix, vehicle_type)
+        totals = snapshot["tank_totals"]
         primary = totals[2 if vehicle_type == "electric" else 1]
-        consumption = primary["consumption"]
-        if data["units"].get("consumption") in {"km/L", "km/l"}:
-            consumption = 100 / consumption if consumption else 0
-        # At a historical observation, the most recent same-day event comes
-        # first. Live API ordering remains entirely unchanged.
-        snapshot = data_with_fuelings(data, list(reversed(prefix)), vehicle_type)
         snapshot["vehicle"] = {
-            **data["vehicle"],
+            **snapshot["vehicle"],
             "tripsum": primary["trip"],
             "quantitysum": primary["quantity"],
-            "consumption": consumption,
         }
-        snapshot["tank_totals"] = totals
         snapshot["reminders"] = []
         snapshot["reference_date"] = fueling_date(record["date"])
         snapshot["event_tank"] = record["tankid"]
@@ -154,6 +213,10 @@ def build_statistics(sensor, snapshots, timezone, convert):
             continue
         value = _sensor_value(sensor, data)
         if value is None:
+            if is_aggregate_sensor(key):
+                # Explicit unknowns replace artificial zeroes from earlier
+                # imports, rather than leaving old database rows untouched.
+                rows[start] = {"start": start, "mean": None, "min": None, "max": None}
             continue
         value = convert(value)
         row = {"start": start}
@@ -163,7 +226,8 @@ def build_statistics(sensor, snapshots, timezone, convert):
         if sensor.state_class in (None, SensorStateClass.MEASUREMENT):
             values = observations.setdefault(start, [])
             values.append(value)
-            row.update(mean=sum(values) / len(values), min=min(values), max=max(values))
+            mean = value if is_aggregate_sensor(key) else sum(values) / len(values)
+            row.update(mean=mean, min=min(values), max=max(values))
         else:
             row["state"] = value
             if key == "last_refuel_odometer":
@@ -259,6 +323,17 @@ class FuelingHistory:
                 _LOGGER.warning("Could not cache API fuelings for CSV import: %s", err, exc_info=True)
         return list(self.records)
 
+    def with_statistics(self, data, records=None):
+        """Attach complete known history without replacing latest API fields."""
+        try:
+            if records is None:
+                incoming = data.get("gas_refuelings", []) + data.get("electric_charges", [])
+                records, _, _ = merge_fuelings(self.records, incoming, self.vehicle_type)
+            return {**data, "fueling_statistics": statistics_data(data, records, self.vehicle_type)}
+        except (KeyError, TypeError, ValueError, OverflowError):
+            _LOGGER.warning("Could not prepare fueling averages", exc_info=True)
+            return data
+
     def validate_units(self, coordinator, records):
         units = coordinator.data["units"]
         if units.get("trip") != "km":
@@ -294,7 +369,7 @@ class FuelingHistory:
             merged, added, duplicates = merge_fuelings(
                 self.records, records, self.vehicle_type
             )
-            data = coordinator.data
+            data = self.with_statistics(coordinator.data, merged)
             series = await self._async_prepare_statistics(data, merged)
             if not series:
                 raise CSVImportError(
@@ -304,6 +379,7 @@ class FuelingHistory:
             self.imported = True
             # Persist the source first, so an interrupted import can be retried.
             await self._async_save()
+            coordinator.async_set_updated_data(data)
             recorder = get_instance(self.hass)
             for metadata, hourly, short in series:
                 async_import_statistics(self.hass, metadata, hourly)
@@ -329,7 +405,7 @@ class FuelingHistory:
         for metadata, hourly, short in series:
             statistic_id = metadata["statistic_id"]
             units = {metadata["unit_class"]: metadata["unit_of_measurement"]}
-            checks = [(hourly[0], "hour", timedelta(hours=1))]
+            checks = [(row, "hour", timedelta(hours=1)) for row in (hourly[0], hourly[-1])]
             if short:
                 checks.append((short[-1], "5minute", timedelta(minutes=5)))
             for expected, period, duration in checks:
@@ -343,10 +419,10 @@ class FuelingHistory:
                     {"state", "sum", "mean", "min", "max"},
                 ).get(statistic_id, [])
                 if not saved or any(
-                    saved[0].get(key) is None
-                    or not math.isclose(
-                        saved[0][key], value, rel_tol=1e-9, abs_tol=1e-9
-                    )
+                    (saved[0].get(key) is not None if value is None else (
+                        saved[0].get(key) is None
+                        or not math.isclose(saved[0][key], value, rel_tol=1e-9, abs_tol=1e-9)
+                    ))
                     for key, value in expected.items()
                     if key in {"state", "sum", "mean", "min", "max"}
                 ):

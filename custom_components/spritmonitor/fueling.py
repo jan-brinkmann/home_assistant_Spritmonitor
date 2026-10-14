@@ -130,10 +130,10 @@ def parse_csv(content, vehicle_type):
             if record["odometer"] is None:
                 raise CSVImportError(f"Zeile {line}: der Tachostand fehlt.")
             if tank_type in {1, 2} and (
-                record["quantity"] is None or record["quantity"] <= 0
+                record["quantity"] is None
             ):
                 raise CSVImportError(
-                    f"Zeile {line}: die Tankmenge fehlt oder ist nicht positiv."
+                    f"Zeile {line}: die Tankmenge fehlt."
                 )
             if record["latitude"] is not None and abs(record["latitude"]) > 90:
                 raise CSVImportError(f"Zeile {line}: ungültiger Breitengrad.")
@@ -213,6 +213,25 @@ def fueling_sort_key(record):
         float(record.get("odometer") or 0),
         int(record["tankid"]),
     )
+
+
+def valid_fuelings(records):
+    """Exclude invalid entries; zero-valued measurements remain valid."""
+    return [record for record in records if record.get("type") not in ("invalid", 0)]
+
+
+def is_inverse_consumption(unit):
+    """Distance per quantity improves when the value increases."""
+    return unit in {"km/L", "km/l", "mi/gal", "mpg", "km/kWh", "mi/kWh"}
+
+
+def display_consumption(value, unit):
+    """Convert a quantity-per-100-distance value to the configured display unit."""
+    if value is None:
+        return None
+    if is_inverse_consumption(unit):
+        return 100 / value if value > 0 else None
+    return value
 
 
 def data_with_fuelings(data, records, vehicle_type):
